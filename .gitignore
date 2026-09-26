@@ -1,0 +1,34 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# next
+.next/
+out/
+build/
+next-env.d.ts
+*.tsbuildinfo
+
+# env — 接続情報は公開しない。.env.example のみコミット
+.env
+.env.local
+.env.*.local
+
+# prisma
+prisma/*.db
+prisma/*.db-journal
+
+# test / coverage
+coverage/
+test-results/
+playwright-report/
+blob-report/
+.playwright/
+
+# misc
+.DS_Store
+*.log
+npm-debug.log*
+.idea/
+.vscode/*
+!.vscode/extensions.json

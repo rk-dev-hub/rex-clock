@@ -1,0 +1,529 @@
+// RexClock — Prisma schema
+// 正典: docs/03-database.md。乖離は docs 側を正とする。
+//
+// 方針:
+// - 時刻は timestamptz(UTC 保存)、日付概念は date。金額計算はしない。
+// - email は citext 拡張を避け String @unique。アプリ層で必ず小文字化して保存/検索する。
+// - 打刻イベントは物理削除しない（canceled フラグ）。集計は再計算可能なキャッシュ。
+// - 参照整合はデフォルト(Restrict)。所有関係が明確な下書き明細のみ Cascade。
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// Enums
+// ============================================================
+
+enum Role {
+  EMPLOYEE
+  ADMIN
+}
+
+enum EmploymentType {
+  FULL_TIME
+  PART_TIME
+  CONTRACT
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum ClockType {
+  CLOCK_IN
+  CLOCK_OUT
+  BREAK_START
+  BREAK_END
+}
+
+enum ClockSource {
+  SELF
+  ADMIN_PROXY
+  CORRECTION
+}
+
+enum RequestStatus {
+  DRAFT
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELED
+}
+
+enum CorrectionOp {
+  ADD
+  UPDATE
+  DELETE
+}
+
+enum LeaveType {
+  PAID
+  ABSENCE
+  SPECIAL_UNPAID
+}
+
+enum LeaveDayPart {
+  FULL
+  AM
+  PM
+}
+
+/// 休暇申請の種類。CANCELLATION は承認済休暇の取消申請（docs/06 submitLeaveCancellation）。
+enum LeaveRequestKind {
+  TAKE
+  CANCELLATION
+}
+
+enum LeaveLedgerKind {
+  GRANT
+  CONSUME
+  EXPIRE
+  ADJUST
+}
+
+/// 平日 / 所定休日 / 法定休日
+enum DayType {
+  WORKDAY
+  PRESCRIBED_HOLIDAY
+  LEGAL_HOLIDAY
+}
+
+enum ClosingStatus {
+  OPEN
+  CLOSED
+}
+
+enum BreakPolicy {
+  ACTUAL
+  AUTO_DEDUCT
+}
+
+enum HolidaySource {
+  BUILTIN
+  MANUAL
+}
+
+enum AuditAction {
+  CLOCK_EDIT
+  APPROVE
+  REJECT
+  CLOSE
+  REOPEN
+  USER_CREATE
+  USER_DISABLE
+  PASSWORD_RESET
+  MASTER_CHANGE
+  LEAVE_GRANT
+}
+
+// ============================================================
+// マスタ: 就業規則・勤務パターン
+// ============================================================
+
+model WorkRule {
+  id                        String      @id @default(uuid()) @db.Uuid
+  name                      String      @default("標準")
+  isDefault                 Boolean     @default(true)
+  standardDailyMinutes      Int         @default(480)
+  /// 締め日。31 = 月末。1–28 または 31。
+  closingDay                Int         @default(31)
+  /// 週起算（0=日, 1=月）。週40h 判定用。
+  weekStartsOn              Int         @default(1)
+  overtimeRatePct           Int         @default(25)
+  nightRatePct              Int         @default(25)
+  legalHolidayRatePct       Int         @default(35)
+  over60hRatePct            Int         @default(50)
+  /// 深夜開始/終了（JST, "HH:mm"）。nightEnd は翌日側。
+  nightStart                String      @default("22:00")
+  nightEnd                  String      @default("05:00")
+  breakPolicy               BreakPolicy @default(ACTUAL)
+  /// AUTO_DEDUCT 時の控除段階: [{ overMinutes, breakMinutes }]
+  autoBreakRules            Json        @default("[{\"overMinutes\":360,\"breakMinutes\":45},{\"overMinutes\":480,\"breakMinutes\":60}]")
+  /// 打刻丸め（分）。1 = 丸めなし。
+  roundingUnitMinutes       Int         @default(1)
+  /// 法定休日の曜日（0=日）。
+  legalHolidayWeekday       Int         @default(0)
+  /// 所定休日の曜日。既定 [6]（土）。
+  prescribedHolidayWeekdays Int[]       @default([6])
+  createdAt                 DateTime    @default(now()) @db.Timestamptz(6)
+  updatedAt                 DateTime    @updatedAt @db.Timestamptz(6)
+
+  patterns     WorkPattern[]
+  calendarDays CalendarDay[]
+}
+
+model WorkPattern {
+  id         String   @id @default(uuid()) @db.Uuid
+  workRuleId String   @db.Uuid
+  name       String
+  isDefault  Boolean  @default(false)
+  createdAt  DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt  DateTime @updatedAt @db.Timestamptz(6)
+
+  workRule WorkRule         @relation(fields: [workRuleId], references: [id])
+  days     WorkPatternDay[]
+  users    User[]
+
+  @@index([workRuleId])
+}
+
+model WorkPatternDay {
+  id                String  @id @default(uuid()) @db.Uuid
+  workPatternId     String  @db.Uuid
+  /// 0–6（0=日）
+  weekday           Int
+  isWorkday         Boolean @default(true)
+  startTime         String  @default("09:00")
+  endTime           String  @default("18:00")
+  /// 所定休憩（分）。AUTO_DEDUCT の基準にも利用。
+  breakMinutes      Int     @default(60)
+  /// 当該曜日の所定労働（分）。
+  prescribedMinutes Int     @default(480)
+
+  workPattern WorkPattern @relation(fields: [workPatternId], references: [id], onDelete: Cascade)
+
+  @@unique([workPatternId, weekday])
+}
+
+// ============================================================
+// ユーザー
+// ============================================================
+
+model User {
+  id                 String         @id @default(uuid()) @db.Uuid
+  employeeCode       String         @unique
+  /// ログイン ID。アプリ層で必ず小文字化して保存・検索する。
+  email              String         @unique
+  name               String
+  passwordHash       String
+  role               Role           @default(EMPLOYEE)
+  employmentType     EmploymentType @default(FULL_TIME)
+  status             UserStatus     @default(ACTIVE)
+  hireDate           DateTime       @db.Date
+  workPatternId      String         @db.Uuid
+  mustChangePassword Boolean        @default(true)
+  createdAt          DateTime       @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime       @updatedAt @db.Timestamptz(6)
+
+  workPattern WorkPattern @relation(fields: [workPatternId], references: [id])
+
+  clockEvents         TimeClockEvent[]    @relation("ClockEventUser")
+  createdClockEvents  TimeClockEvent[]    @relation("ClockEventCreatedBy")
+  dailySummaries      DailySummary[]
+  monthlyAggregates   MonthlyAggregate[]
+  correctionRequests  CorrectionRequest[] @relation("CorrectionRequester")
+  correctionApprovals CorrectionRequest[] @relation("CorrectionApprover")
+  leaveRequests       LeaveRequest[]      @relation("LeaveRequester")
+  leaveApprovals      LeaveRequest[]      @relation("LeaveApprover")
+  leaveGrants         LeaveGrant[]        @relation("LeaveGrantUser")
+  createdLeaveGrants  LeaveGrant[]        @relation("LeaveGrantCreatedBy")
+  leaveLedgers        LeaveLedger[]
+  closedPeriods       ClosingPeriod[]     @relation("PeriodClosedBy")
+  reopenedPeriods     ClosingPeriod[]     @relation("PeriodReopenedBy")
+  auditLogsAsActor    AuditLog[]          @relation("AuditActor")
+  auditLogsAsSubject  AuditLog[]          @relation("AuditSubject")
+
+  @@index([status])
+  @@index([role])
+}
+
+// ============================================================
+// 打刻
+// ============================================================
+
+model TimeClockEvent {
+  id                  String      @id @default(uuid()) @db.Uuid
+  userId              String      @db.Uuid
+  type                ClockType
+  /// 打刻時刻（秒精度）
+  occurredAt          DateTime    @db.Timestamptz(6)
+  /// 勤務日（日跨ぎは出勤日へ寄せる）。導出時に確定。
+  businessDate        DateTime    @db.Date
+  source              ClockSource @default(SELF)
+  /// 修正で無効化された場合 true（物理削除しない）。
+  canceled            Boolean     @default(false)
+  correctionRequestId String?     @db.Uuid
+  /// 実際に登録した人（代理打刻の操作者）。
+  createdById         String      @db.Uuid
+  note                String?
+  createdAt           DateTime    @default(now()) @db.Timestamptz(6)
+
+  user              User               @relation("ClockEventUser", fields: [userId], references: [id])
+  createdBy         User               @relation("ClockEventCreatedBy", fields: [createdById], references: [id])
+  correctionRequest CorrectionRequest? @relation(fields: [correctionRequestId], references: [id])
+  correctionLines   CorrectionLine[]
+
+  @@index([userId, businessDate])
+  @@index([userId, occurredAt])
+  @@index([businessDate])
+  @@index([correctionRequestId])
+  @@index([canceled])
+}
+
+// ============================================================
+// 日次サマリ / 月次集計（再計算可能なキャッシュ）
+// ============================================================
+
+model DailySummary {
+  id                       String        @id @default(uuid()) @db.Uuid
+  userId                   String        @db.Uuid
+  workDate                 DateTime      @db.Date
+  dayType                  DayType
+  firstIn                  DateTime?     @db.Timestamptz(6)
+  lastOut                  DateTime?     @db.Timestamptz(6)
+  breakMinutes             Int           @default(0)
+  workedMinutes            Int           @default(0)
+  prescribedMinutes        Int           @default(0)
+  /// 法定内残業（所定超〜8h まで）
+  withinStatutoryOtMinutes Int           @default(0)
+  /// 法定外残業（8h 超・週40h 超。週次反映後）
+  overStatutoryOtMinutes   Int           @default(0)
+  nightMinutes             Int           @default(0)
+  legalHolidayMinutes      Int           @default(0)
+  lateMinutes              Int           @default(0)
+  earlyLeaveMinutes        Int           @default(0)
+  leaveType                LeaveType?
+  leaveDayPart             LeaveDayPart?
+  /// 有給で労働扱いに算入した分（全日=所定, 半休=所定/2）
+  paidLeaveCountedMinutes  Int           @default(0)
+  /// 例: ["MISSING_CLOCK_OUT","BREAK_SHORTAGE","HOLIDAY_WORK"]
+  flags                    Json          @default("[]")
+  closingPeriodId          String?       @db.Uuid
+  computedAt               DateTime      @default(now()) @db.Timestamptz(6)
+
+  user          User           @relation(fields: [userId], references: [id])
+  closingPeriod ClosingPeriod? @relation(fields: [closingPeriodId], references: [id])
+
+  @@unique([userId, workDate])
+  @@index([workDate])
+  @@index([closingPeriodId])
+}
+
+model MonthlyAggregate {
+  id                       String   @id @default(uuid()) @db.Uuid
+  userId                   String   @db.Uuid
+  periodStart              DateTime @db.Date
+  periodEnd                DateTime @db.Date
+  workDays                 Int      @default(0)
+  absenceDays              Int      @default(0)
+  paidLeaveFullDays        Int      @default(0)
+  paidLeaveHalfDays        Int      @default(0)
+  /// 有給で労働扱いに算入した分の合計（全日=所定, 半休=所定/2）。賃金支払対象。
+  paidLeaveMinutes         Int      @default(0)
+  totalWorkedMinutes       Int      @default(0)
+  withinPrescribedMinutes  Int      @default(0)
+  withinStatutoryOtMinutes Int      @default(0)
+  /// 時間外 25%（月60h まで）
+  overtime25Minutes        Int      @default(0)
+  /// 時間外 50%（月60h 超）
+  overtime50Minutes        Int      @default(0)
+  nightMinutes             Int      @default(0)
+  legalHolidayMinutes      Int      @default(0)
+  lateCount                Int      @default(0)
+  lateMinutes              Int      @default(0)
+  earlyLeaveCount          Int      @default(0)
+  earlyLeaveMinutes        Int      @default(0)
+  breakMinutes             Int      @default(0)
+  /// true の間は要再計算。
+  stale                    Boolean  @default(true)
+  computedAt               DateTime @default(now()) @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, periodStart])
+  @@index([periodStart])
+  @@index([stale])
+}
+
+// ============================================================
+// 打刻修正申請
+// ============================================================
+
+model CorrectionRequest {
+  id              String        @id @default(uuid()) @db.Uuid
+  userId          String        @db.Uuid
+  targetDate      DateTime      @db.Date
+  status          RequestStatus @default(DRAFT)
+  reason          String
+  approverId      String?       @db.Uuid
+  decidedAt       DateTime?     @db.Timestamptz(6)
+  decisionComment String?
+  createdAt       DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime      @updatedAt @db.Timestamptz(6)
+
+  user            User             @relation("CorrectionRequester", fields: [userId], references: [id])
+  approver        User?            @relation("CorrectionApprover", fields: [approverId], references: [id])
+  lines           CorrectionLine[]
+  generatedEvents TimeClockEvent[]
+
+  @@index([userId, targetDate])
+  @@index([status])
+}
+
+model CorrectionLine {
+  id            String       @id @default(uuid()) @db.Uuid
+  requestId     String       @db.Uuid
+  op            CorrectionOp
+  targetEventId String?      @db.Uuid
+  clockType     ClockType?
+  occurredAt    DateTime?    @db.Timestamptz(6)
+
+  request     CorrectionRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  targetEvent TimeClockEvent?   @relation(fields: [targetEventId], references: [id])
+
+  @@index([requestId])
+  @@index([targetEventId])
+}
+
+// ============================================================
+// 休暇申請 / 有給付与・台帳
+// ============================================================
+
+model LeaveRequest {
+  id              String           @id @default(uuid()) @db.Uuid
+  userId          String           @db.Uuid
+  kind            LeaveRequestKind @default(TAKE)
+  type            LeaveType
+  startDate       DateTime         @db.Date
+  endDate         DateTime         @db.Date
+  dayPart         LeaveDayPart     @default(FULL)
+  reason          String
+  status          RequestStatus    @default(PENDING)
+  approverId      String?          @db.Uuid
+  decidedAt       DateTime?        @db.Timestamptz(6)
+  decisionComment String?
+  /// 取消申請で無効化された場合、取消側 LeaveRequest を参照。
+  supersededById  String?          @db.Uuid
+  createdAt       DateTime         @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime         @updatedAt @db.Timestamptz(6)
+
+  user         User           @relation("LeaveRequester", fields: [userId], references: [id])
+  approver     User?          @relation("LeaveApprover", fields: [approverId], references: [id])
+  supersededBy LeaveRequest?  @relation("LeaveSupersede", fields: [supersededById], references: [id])
+  supersedes   LeaveRequest[] @relation("LeaveSupersede")
+  ledgers      LeaveLedger[]
+
+  @@index([userId, startDate])
+  @@index([status])
+}
+
+model LeaveGrant {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @db.Uuid
+  grantedDays Decimal  @db.Decimal(4, 1)
+  grantDate   DateTime @db.Date
+  expiryDate  DateTime @db.Date
+  reason      String
+  createdById String   @db.Uuid
+  createdAt   DateTime @default(now()) @db.Timestamptz(6)
+
+  user      User          @relation("LeaveGrantUser", fields: [userId], references: [id])
+  createdBy User          @relation("LeaveGrantCreatedBy", fields: [createdById], references: [id])
+  ledgers   LeaveLedger[]
+
+  @@index([userId, expiryDate])
+}
+
+model LeaveLedger {
+  id             String          @id @default(uuid()) @db.Uuid
+  userId         String          @db.Uuid
+  kind           LeaveLedgerKind
+  /// +付与 / −消化・失効。半日 = 0.5。
+  days           Decimal         @db.Decimal(4, 1)
+  effectiveDate  DateTime        @db.Date
+  grantId        String?         @db.Uuid
+  leaveRequestId String?         @db.Uuid
+  note           String?
+  createdAt      DateTime        @default(now()) @db.Timestamptz(6)
+
+  user         User          @relation(fields: [userId], references: [id])
+  grant        LeaveGrant?   @relation(fields: [grantId], references: [id])
+  leaveRequest LeaveRequest? @relation(fields: [leaveRequestId], references: [id])
+
+  @@index([userId, effectiveDate])
+  @@index([grantId])
+  @@index([leaveRequestId])
+}
+
+// ============================================================
+// 休日カレンダー
+// ============================================================
+
+model Holiday {
+  id     String        @id @default(uuid()) @db.Uuid
+  date   DateTime      @unique @db.Date
+  name   String
+  source HolidaySource @default(BUILTIN)
+}
+
+model CalendarDay {
+  id             String   @id @default(uuid()) @db.Uuid
+  workRuleId     String   @db.Uuid
+  date           DateTime @db.Date
+  dayType        DayType
+  isHoliday      Boolean  @default(false)
+  label          String?
+  overrideReason String?
+  createdAt      DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime @updatedAt @db.Timestamptz(6)
+
+  workRule WorkRule @relation(fields: [workRuleId], references: [id])
+
+  @@unique([workRuleId, date])
+  @@index([date])
+}
+
+// ============================================================
+// 月次締め
+// ============================================================
+
+model ClosingPeriod {
+  id           String        @id @default(uuid()) @db.Uuid
+  periodStart  DateTime      @unique @db.Date
+  periodEnd    DateTime      @db.Date
+  status       ClosingStatus @default(OPEN)
+  closedById   String?       @db.Uuid
+  closedAt     DateTime?     @db.Timestamptz(6)
+  reopenedById String?       @db.Uuid
+  reopenedAt   DateTime?     @db.Timestamptz(6)
+  note         String?
+  createdAt    DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime      @updatedAt @db.Timestamptz(6)
+
+  closedBy       User?          @relation("PeriodClosedBy", fields: [closedById], references: [id])
+  reopenedBy     User?          @relation("PeriodReopenedBy", fields: [reopenedById], references: [id])
+  dailySummaries DailySummary[]
+
+  @@index([status])
+}
+
+// ============================================================
+// 監査ログ（追記のみ）
+// ============================================================
+
+model AuditLog {
+  id            String      @id @default(uuid()) @db.Uuid
+  actorId       String      @db.Uuid
+  action        AuditAction
+  targetType    String
+  targetId      String?
+  subjectUserId String?     @db.Uuid
+  before        Json?
+  after         Json?
+  comment       String?
+  createdAt     DateTime    @default(now()) @db.Timestamptz(6)
+
+  actor       User  @relation("AuditActor", fields: [actorId], references: [id])
+  subjectUser User? @relation("AuditSubject", fields: [subjectUserId], references: [id])
+
+  @@index([createdAt])
+  @@index([subjectUserId, createdAt])
+  @@index([action])
+}

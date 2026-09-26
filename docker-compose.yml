@@ -1,0 +1,71 @@
+# 使い方:
+#   docker compose up -d              … PostgreSQL のみ起動（アプリは pnpm dev でネイティブ実行する開発向け）
+#   docker compose --profile app up   … PostgreSQL + アプリをまとめて起動（お試し用。Node.js / pnpm 不要）
+# 公開リポジトリのためパスワード・鍵はすべてダミー。
+# 実運用では DATABASE_URL を自前の DB に向け、このファイルは使わない。
+name: rex-clock
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: rex-clock-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rexclock
+      POSTGRES_PASSWORD: rexclock
+      POSTGRES_DB: rexclock
+      TZ: Asia/Tokyo
+    ports:
+      # 5432 が他プロジェクトと競合する場合は .env に DB_PORT=5433 等を書けば変更できる
+      # （DATABASE_URL のポートも合わせること。docker compose は .env を自動で読む）。
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - rex-clock-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rexclock -d rexclock"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # お試し起動用のアプリ（Next.js 開発サーバー）。--profile app を付けたときだけ起動する。
+  app:
+    profiles: [app]
+    build: .
+    container_name: rex-clock-app
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # コンテナ間通信なので .env の DATABASE_URL（localhost 向け）ではなく db サービスを参照する
+      DATABASE_URL: postgresql://rexclock:rexclock@db:5432/rexclock?schema=public
+      AUTH_SECRET: ${AUTH_SECRET:-docker-only-dummy-secret-do-not-use-in-production}
+      AUTH_URL: http://localhost:${APP_PORT:-3000}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Asia/Tokyo}
+      INITIAL_ADMIN_EMAIL: ${INITIAL_ADMIN_EMAIL:-admin@example.com}
+      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:-ChangeMe123!}
+      CSV_ENCODING: ${CSV_ENCODING:-utf8-bom}
+    ports:
+      # 3000 が競合する場合は .env に APP_PORT=3001 等を書けば変更できる。
+      - "${APP_PORT:-3000}:3000"
+    volumes:
+      # ソースをマウントして編集を即時反映。node_modules と .next はホストと混ざらないよう専用ボリュームに分ける
+      - .:/app
+      - rex-clock-node-modules:/app/node_modules
+      - rex-clock-next:/app/.next
+
+  # 任意: ブラウザから DB を覗く。http://localhost:8080（アプリ本体には不要）
+  adminer:
+    image: adminer:5
+    container_name: rex-clock-adminer
+    restart: unless-stopped
+    ports:
+      # 8080 が競合する場合は .env に ADMINER_PORT=8081 等を書けば変更できる。
+      - "${ADMINER_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  rex-clock-db-data:
+  rex-clock-node-modules:
+  rex-clock-next:

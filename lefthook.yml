@@ -1,0 +1,19 @@
+# コミット/プッシュ前の品質ゲート。 pnpm install で自動セットアップされる（prepare スクリプト）。
+pre-commit:
+  parallel: true
+  commands:
+    lint:
+      glob: "*.{js,jsx,ts,tsx,mjs}"
+      run: pnpm eslint --fix --no-warn-ignored {staged_files}
+      stage_fixed: true
+    format:
+      glob: "*.{js,jsx,ts,tsx,mjs,json,css,md,yml,yaml,prisma}"
+      run: pnpm prettier --write --ignore-unknown {staged_files}
+      stage_fixed: true
+    typecheck:
+      run: pnpm typecheck
+
+pre-push:
+  commands:
+    test:
+      run: pnpm test
